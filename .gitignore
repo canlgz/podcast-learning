@@ -30,6 +30,8 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+# 範本要進版控，README 第一步就是 cp .env.example .env.local
+!.env.example
 
 # vercel
 .vercel
