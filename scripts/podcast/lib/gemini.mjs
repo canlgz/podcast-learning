@@ -60,39 +60,95 @@ export function mimeForFile(filePath) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * 尖峰時段 Gemini 會回 503「high demand」，通常幾分鐘後才恢復，
+ * 所以重試預算用「總時間」算，不是固定次數。可用 env 覆寫。
+ */
+const RETRY_BUDGET_MS = Number(process.env.GEMINI_RETRY_BUDGET_MS || 300000);
+const MAX_BACKOFF_MS = Number(process.env.GEMINI_MAX_BACKOFF_MS || 45000);
+
+/** 主模型滿載／配額用盡／金鑰拿不到時，依序讓這些模型頂上。 */
+export const DEFAULT_FALLBACK_MODELS = (
+  process.env.GEMINI_FALLBACK_MODELS || "gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash-lite"
+)
+  .split(",")
+  .map((name) => name.trim())
+  .filter(Boolean);
+
+class GeminiHttpError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.status = status;
+  }
+}
+
 function isRetryable(status) {
   return status === 408 || status === 409 || status === 429 || status >= 500;
 }
 
-async function fetchWithRetry(url, init, { label = "request", attempts = 4 } = {}) {
+/** 值得換一個模型再試：滿載（5xx）、配額用盡（429）、這把金鑰拿不到（404）。 */
+function shouldSwapModel(error) {
+  const status = error?.status;
+  return status === 404 || status === 429 || status >= 500;
+}
+
+/** Google 偶爾會給 Retry-After，有就聽它的。 */
+function retryAfterMs(response) {
+  const header = response.headers.get("retry-after");
+  if (!header) return null;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds)) return Math.min(MAX_BACKOFF_MS, Math.max(0, seconds * 1000));
+  const at = Date.parse(header);
+  return Number.isFinite(at) ? Math.min(MAX_BACKOFF_MS, Math.max(0, at - Date.now())) : null;
+}
+
+async function fetchWithRetry(url, init, { label = "request", attempts = 8, budgetMs = RETRY_BUDGET_MS } = {}) {
+  const deadline = Date.now() + budgetMs;
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    let waitMs = null;
     try {
       const response = await fetch(url, init);
       if (response.ok) return response;
       const detail = await response.text();
-      if (!isRetryable(response.status) || attempt === attempts) {
-        throw new Error(`${label} 失敗 HTTP ${response.status}: ${detail.slice(0, 600)}`);
-      }
-      lastError = new Error(`${label} HTTP ${response.status}`);
+      const failure = new GeminiHttpError(
+        `${label} 失敗 HTTP ${response.status}: ${detail.slice(0, 600)}`,
+        response.status,
+      );
+      if (!isRetryable(response.status)) throw failure;
+      lastError = failure;
+      waitMs = retryAfterMs(response);
     } catch (error) {
+      if (error instanceof GeminiHttpError && !isRetryable(error.status)) throw error;
       lastError = error;
-      if (attempt === attempts) throw error;
-      if (error?.message?.includes("失敗 HTTP")) throw error;
     }
-    const backoff = Math.round(1500 * 2 ** (attempt - 1) * (0.75 + Math.random() * 0.5));
-    console.log(`   ↻ ${label} 第 ${attempt} 次失敗，${backoff}ms 後重試`);
+    if (attempt === attempts) break;
+    const backoff = waitMs ?? Math.round(Math.min(MAX_BACKOFF_MS, 2000 * 2 ** (attempt - 1)) * (0.75 + Math.random() * 0.5));
+    if (Date.now() + backoff > deadline) {
+      console.log(`   ↻ ${label} 重試預算 ${Math.round(budgetMs / 1000)}s 用完`);
+      break;
+    }
+    const reason = lastError?.status ? `HTTP ${lastError.status}` : "連線失敗";
+    console.log(`   ↻ ${label} 第 ${attempt} 次失敗（${reason}），${(backoff / 1000).toFixed(1)}s 後重試`);
     await sleep(backoff);
   }
   throw lastError;
 }
 
 export class GeminiClient {
-  constructor({ apiKey, model = "gemini-2.5-flash", verbose = true }) {
+  constructor({ apiKey, model = "gemini-2.5-flash", fallbackModels = DEFAULT_FALLBACK_MODELS, verbose = true }) {
     this.apiKey = apiKey;
     this.model = model;
+    this.fallbackModels = fallbackModels;
+    // 某個模型頂上之後就記住，後面的 pass 直接用它，不用每次都先去撞牆。
+    this.modelSwaps = new Map();
     this.verbose = verbose;
     this.usage = { textInTokens: 0, audioInTokens: 0, outTokens: 0, calls: 0, costUsd: 0 };
+  }
+
+  /** 這次要依序嘗試的模型：上次頂上的 → 原本指定的 → 備援清單。 */
+  modelChain(requested) {
+    return [...new Set([this.modelSwaps.get(requested), requested, ...this.fallbackModels].filter(Boolean))];
   }
 
   /** 以 resumable upload 上傳音檔到 Files API（支援大檔，48 小時內有效）。 */
@@ -130,7 +186,7 @@ export class GeminiClient {
         },
         body: bytes,
       },
-      { label: "files:upload", attempts: 2 },
+      { label: "files:upload", attempts: 3 },
     );
 
     const payload = await finalize.json();
@@ -224,46 +280,63 @@ export class GeminiClient {
     model: modelOverride,
     label = "generate",
   }) {
-    const model = modelOverride || this.model;
-    // 2.5 Pro 不接受關閉 thinking（thinkingBudget 0），最低要 128。
-    const effectiveBudget =
-      thinkingBudget != null && /pro|transcribe/i.test(model) ? Math.max(128, thinkingBudget) : thinkingBudget;
+    const requested = modelOverride || this.model;
 
-    const parts = [{ text: prompt }];
-    if (fileUri) parts.push({ file_data: { mime_type: fileMimeType || "audio/mpeg", file_uri: fileUri } });
+    const callOnce = async (model) => {
+      // 2.5 Pro 不接受關閉 thinking（thinkingBudget 0），最低要 128。
+      const effectiveBudget =
+        thinkingBudget != null && /pro|transcribe/i.test(model) ? Math.max(128, thinkingBudget) : thinkingBudget;
 
-    const body = {
-      contents: [{ role: "user", parts }],
-      generationConfig: {
-        temperature,
-        maxOutputTokens,
-        ...(schema ? { responseMimeType: "application/json", responseSchema: schema } : {}),
-        ...(effectiveBudget != null ? { thinkingConfig: { thinkingBudget: effectiveBudget } } : {}),
-      },
-      ...(systemInstruction ? { systemInstruction: { parts: [{ text: systemInstruction }] } } : {}),
-    };
+      const parts = [{ text: prompt }];
+      if (fileUri) parts.push({ file_data: { mime_type: fileMimeType || "audio/mpeg", file_uri: fileUri } });
 
-    const url = `${API_ROOT}/${API_VERSION}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(this.apiKey)}`;
-    let response;
-    try {
-      response = await fetchWithRetry(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      }, { label });
-    } catch (error) {
-      // 少數模型不吃 thinkingConfig，退一步重試一次。
-      if (thinkingBudget != null && /thinking/i.test(error.message || "")) {
-        delete body.generationConfig.thinkingConfig;
-        response = await fetchWithRetry(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        }, { label: `${label} (no-thinking)` });
-      } else {
+      const body = {
+        contents: [{ role: "user", parts }],
+        generationConfig: {
+          temperature,
+          maxOutputTokens,
+          ...(schema ? { responseMimeType: "application/json", responseSchema: schema } : {}),
+          ...(effectiveBudget != null ? { thinkingConfig: { thinkingBudget: effectiveBudget } } : {}),
+        },
+        ...(systemInstruction ? { systemInstruction: { parts: [{ text: systemInstruction }] } } : {}),
+      };
+
+      const url = `${API_ROOT}/${API_VERSION}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(this.apiKey)}`;
+      const tag = model === requested ? label : `${label} → ${model}`;
+      const send = () =>
+        fetchWithRetry(
+          url,
+          { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+          { label: tag },
+        );
+
+      try {
+        return await send();
+      } catch (error) {
+        // 少數模型不吃 thinkingConfig，退一步重試一次。
+        if (thinkingBudget != null && /thinking/i.test(error.message || "")) {
+          delete body.generationConfig.thinkingConfig;
+          return await send();
+        }
         throw error;
       }
+    };
+
+    // 重試完還是不行，就換下一個模型頂上，而不是讓整集作廢。
+    const chain = this.modelChain(requested);
+    let response = null;
+    let model = requested;
+    for (let index = 0; index < chain.length; index += 1) {
+      model = chain[index];
+      try {
+        response = await callOnce(model);
+        break;
+      } catch (error) {
+        if (index === chain.length - 1 || !shouldSwapModel(error)) throw error;
+        console.log(`   ⇄ ${model} 目前不可用（HTTP ${error.status}），改用 ${chain[index + 1]} 繼續`);
+      }
     }
+    if (model !== requested) this.modelSwaps.set(requested, model);
 
     const payload = await response.json();
     const candidate = payload.candidates?.[0];
@@ -282,10 +355,10 @@ export class GeminiClient {
 
     if (this.verbose) {
       const costNote = `in ${usage.audioTokens + usage.textTokens} / out ${usage.outTokens} tokens`;
-      console.log(`   · ${label}: ${finishReason} (${costNote})`);
+      console.log(`   · ${model === requested ? label : `${label} → ${model}`}: ${finishReason} (${costNote})`);
     }
 
-    return { text, json, finishReason, usage, raw: payload };
+    return { text, json, finishReason, usage, model, raw: payload };
   }
 
   usageReport() {

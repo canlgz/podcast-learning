@@ -13,6 +13,7 @@
  *   --max-rounds N      逐字稿續寫上限（預設 6）
  *   --model NAME        章節／互動腳本用的模型（預設 GEMINI_MODEL）
  *   --transcribe-model NAME  逐字稿用的模型（預設 GEMINI_TRANSCRIBE_MODEL，未設則同 --model）
+ *   --fallback-models A,B    主模型滿載（503）或不可用時的備援順序
  *   --dry               只列出會處理什麼，不呼叫 API、不寫檔
  *   --watch             處理完後持續監看資料夾
  *   --keep-removed      來源檔消失時仍保留舊資料
@@ -61,6 +62,7 @@ const options = {
     "--transcribe-model",
     process.env.GEMINI_TRANSCRIBE_MODEL || getArg("--model", process.env.GEMINI_MODEL || "gemini-3.8-flash"),
   ),
+  fallbackModels: getArg("--fallback-models"),
   dry: hasArg("--dry"),
   watch: hasArg("--watch"),
   keepRemoved: hasArg("--keep-removed"),
@@ -164,6 +166,8 @@ function transcriptBlockOf(segments, maxChars = 42000) {
 async function runPasses({ client, filePath, fingerprint, title, durationSeconds, notes }) {
   const durationLabel = formatClock(durationSeconds);
   const mimeType = mimeForFile(filePath);
+  // 主模型滿載時 client 會自動換備援，記下來寫進 stats。
+  const modelsUsed = new Set();
 
   // 上傳到 Files API 的檔案在 Google 端保存 48 小時，快取下來讓重跑不用再傳一次 76MB。
   let uploaded = null;
@@ -208,6 +212,7 @@ async function runPasses({ client, filePath, fingerprint, title, durationSeconds
       model: options.model,
       label: `pass A 章節地圖（${options.model}）`,
     });
+    modelsUsed.add(result.model);
     if (!result.json) throw new Error(`章節地圖解析失敗（finishReason=${result.finishReason}）`);
     outline = OUTLINE_PASS.normalize(result.json, { durationSeconds });
     if (!outline.chapters.length) throw new Error("章節地圖為空");
@@ -217,18 +222,31 @@ async function runPasses({ client, filePath, fingerprint, title, durationSeconds
   }
   console.log(`   → ${outline.chapters.length} 章、${outline.keyTerms.length} 個關鍵詞`);
 
-  // ---- Pass B：逐字稿（會自動續寫到結尾）
+  // ---- Pass B：逐字稿（自動續寫到結尾；中斷過就從快取接著跑）
   const transcriptCacheKey = `${TRANSCRIPT_PASS.version}-${options.transcribeModel}`;
-  let transcript = options.force ? null : await readCache(fingerprint, TRANSCRIPT_PASS.name, transcriptCacheKey);
+  const cachedTranscript = options.force
+    ? null
+    : await readCache(fingerprint, TRANSCRIPT_PASS.name, transcriptCacheKey);
+  let transcript;
+
   if (options.skipTranscript) {
-    transcript = transcript || { segments: [], coverageSec: 0, complete: false, skipped: true };
+    transcript = cachedTranscript || { segments: [], coverageSec: 0, complete: false, skipped: true };
     console.log("   · pass B 逐字稿：依 --skip-transcript 跳過");
-  } else if (!transcript) {
+  } else if (cachedTranscript?.complete) {
+    transcript = cachedTranscript;
+    console.log("   · pass B 逐字稿：使用快取");
+  } else {
     const file = await ensureUpload();
     const chapterHint = chapterBlockOf(outline);
-    const batches = [];
-    let fromSec = 0;
+    // 上次沒跑完的部分直接沿用，不用重聽已經轉好的段落。
+    const priorSegments = cachedTranscript?.segments || [];
+    const batches = priorSegments.length ? [priorSegments] : [];
+    let fromSec = priorSegments.length ? priorSegments[priorSegments.length - 1].startSec : 0;
     let complete = false;
+
+    if (priorSegments.length) {
+      console.log(`   ↻ pass B 逐字稿：接續上次的 ${formatClock(fromSec)}（已有 ${priorSegments.length} 行）`);
+    }
 
     // 專用轉錄模型（gemini-3.5-transcribe）不支援 JSON mode，也不吃 thinkingConfig。
     const isDedicatedTranscriber = /transcribe/i.test(options.transcribeModel);
@@ -252,6 +270,7 @@ async function runPasses({ client, filePath, fingerprint, title, durationSeconds
             prompt: TRANSCRIPT_PASS.prompt({ durationLabel, fromSec: startSec, chapterHint }),
             schema: TRANSCRIPT_PASS.schema,
           });
+          modelsUsed.add(structured.model);
           return {
             batch: TRANSCRIPT_PASS.normalize(structured.json || {}, { durationSeconds, fromSec: startSec }),
             finishReason: structured.finishReason,
@@ -267,14 +286,39 @@ async function runPasses({ client, filePath, fingerprint, title, durationSeconds
         ...shared,
         prompt: TRANSCRIPT_PASS.promptText({ durationLabel, fromSec: startSec, chapterHint }),
       });
+      modelsUsed.add(plain.model);
       return {
         batch: TRANSCRIPT_PASS.normalizeText(plain.text, { durationSeconds, fromSec: startSec }),
         finishReason: plain.finishReason,
       };
     };
 
+    // 每輪都先落地，某一輪掛掉時前面轉好的段落不會白跑。
+    const saveProgress = async (done) => {
+      const merged = mergeTranscriptLines(batches, durationSeconds);
+      const snapshot = {
+        segments: merged,
+        // 用最後一行的「開始時間」算覆蓋率：endSec 會被補成整集長度，拿來算會永遠是 100%。
+        coverageSec: merged.length ? merged[merged.length - 1].startSec : 0,
+        complete: done,
+      };
+      await writeCache(fingerprint, TRANSCRIPT_PASS.name, transcriptCacheKey, snapshot);
+      return snapshot;
+    };
+
     for (let round = 1; round <= options.maxRounds; round += 1) {
-      const { batch, finishReason } = await runRound(round, fromSec);
+      let batch;
+      let finishReason;
+      try {
+        ({ batch, finishReason } = await runRound(round, fromSec));
+      } catch (error) {
+        // 模型滿載之類的錯誤不該讓整集作廢：保留已完成的部分，下次重跑接著補。
+        const reason = error.message.split("\n")[0];
+        notes.push(`逐字稿第 ${round} 輪失敗：${reason}`);
+        console.log(`   ! pass B 第 ${round} 輪失敗，保留已完成的部分：${reason}`);
+        break;
+      }
+
       if (!batch.lines.length) {
         notes.push(`逐字稿第 ${round} 輪沒有新內容（finishReason=${finishReason}）`);
         break;
@@ -282,6 +326,7 @@ async function runPasses({ client, filePath, fingerprint, title, durationSeconds
       batches.push(batch.lines);
       const lastSec = batch.lines[batch.lines.length - 1].startSec;
       console.log(`     ↳ ${batch.lines.length} 行，覆蓋到 ${formatClock(lastSec)}`);
+      await saveProgress(false);
 
       // 容許值隨節目長度縮放：短音檔不能用 45 秒當門檻，否則會誤判已到結尾。
       const tailTolerance = Math.min(45, Math.max(12, durationSeconds * 0.03));
@@ -298,21 +343,21 @@ async function runPasses({ client, filePath, fingerprint, title, durationSeconds
       if (round === options.maxRounds) notes.push(`逐字稿達到續寫上限 ${options.maxRounds} 輪`);
     }
 
-    const segments = mergeTranscriptLines(batches, durationSeconds);
-    transcript = {
-      segments,
-      coverageSec: segments.length ? segments[segments.length - 1].endSec : 0,
-      complete,
-    };
-    await writeCache(fingerprint, TRANSCRIPT_PASS.name, transcriptCacheKey, transcript);
-  } else {
-    console.log("   · pass B 逐字稿：使用快取");
+    transcript = await saveProgress(complete);
   }
   const transcriptChars = transcript.segments.reduce((sum, row) => sum + row.text.length, 0);
   console.log(`   → 逐字稿 ${transcript.segments.length} 行 / ${transcriptChars} 字，覆蓋到 ${formatClock(transcript.coverageSec)}`);
 
   // ---- Pass C：互動腳本（純文字，最便宜）
-  let interact = options.force ? null : await readCache(fingerprint, INTERACT_PASS.name, INTERACT_PASS.version);
+  // 互動卡的品質取決於逐字稿完整度，所以把完整度寫進快取 key：
+  // 逐字稿之後被補齊時會自然 miss、重新產一份對得上的互動卡。
+  const transcriptCoverage = durationSeconds > 0 ? Math.min(1, transcript.coverageSec / durationSeconds) : 0;
+  const interactCacheKey = !transcript.segments.length
+    ? `${INTERACT_PASS.version}-outline-only`
+    : transcript.complete || transcriptCoverage >= 0.9
+      ? `${INTERACT_PASS.version}`
+      : `${INTERACT_PASS.version}-p${Math.round(transcriptCoverage * 10)}`;
+  let interact = options.force ? null : await readCache(fingerprint, INTERACT_PASS.name, interactCacheKey);
   if (!interact) {
     const cueTarget = Math.min(16, Math.max(5, Math.round(durationSeconds / 180) || 6));
     const result = await client.generate({
@@ -332,16 +377,22 @@ async function runPasses({ client, filePath, fingerprint, title, durationSeconds
       model: options.model,
       label: `pass C 互動腳本（${options.model}）`,
     });
+    modelsUsed.add(result.model);
     if (!result.json) throw new Error(`互動腳本解析失敗（finishReason=${result.finishReason}）`);
     interact = INTERACT_PASS.normalize(result.json, { durationSeconds, chapters: outline.chapters });
     if (!interact.cues.length) throw new Error("互動腳本為空");
-    await writeCache(fingerprint, INTERACT_PASS.name, INTERACT_PASS.version, interact);
+    await writeCache(fingerprint, INTERACT_PASS.name, interactCacheKey, interact);
   } else {
     console.log("   · pass C 互動腳本：使用快取");
   }
   console.log(`   → ${interact.cues.length} 張互動卡、${interact.gaps.length} 個資訊缺口`);
 
-  return { outline, transcript, interact, transcriptChars };
+  const swapped = [...modelsUsed].filter(
+    (name) => name && name !== options.model && name !== options.transcribeModel,
+  );
+  if (swapped.length) notes.push(`主模型不可用，改用備援模型：${swapped.join("、")}`);
+
+  return { outline, transcript, interact, transcriptChars, modelsUsed: [...modelsUsed] };
 }
 
 /* ------------------------------------------------------------ orchestration */
@@ -367,7 +418,13 @@ async function buildOnce() {
   }
   const previousById = new Map((previous.episodes || []).map((episode) => [episode.id, episode]));
 
-  const client = new GeminiClient({ model: options.model, apiKey: options.dry ? "dry" : safeApiKey() });
+  const client = new GeminiClient({
+    model: options.model,
+    apiKey: options.dry ? "dry" : safeApiKey(),
+    ...(options.fallbackModels
+      ? { fallbackModels: options.fallbackModels.split(",").map((name) => name.trim()).filter(Boolean) }
+      : {}),
+  });
   const episodes = [];
   let processed = 0;
 
@@ -439,7 +496,7 @@ async function buildOnce() {
     const startedAt = Date.now();
     const usageBefore = client.usageReport();
     try {
-      const { outline, transcript, interact, transcriptChars } = await runPasses({
+      const { outline, transcript, interact, transcriptChars, modelsUsed } = await runPasses({
         client,
         filePath,
         fingerprint,
@@ -477,6 +534,7 @@ async function buildOnce() {
           builtAt: new Date().toISOString(),
           model: options.model,
           transcribeModel: options.transcribeModel,
+          actualModels: modelsUsed,
           elapsedSec: Math.round((Date.now() - startedAt) / 1000),
           chapterCount: outline.chapters.length,
           segmentCount: transcript.segments.length,

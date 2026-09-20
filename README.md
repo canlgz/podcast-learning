@@ -86,6 +86,7 @@
 ```
 
 三個 pass 與音檔上傳結果都會快取在 `.cache/podcast/`，**重跑同一個檔案不會再次計費**。
+逐字稿是**每轉完一輪就存一次**，所以中途失敗再跑一次會從上次的時間點接著補，不會從頭來過。
 
 ---
 
@@ -217,6 +218,7 @@ node scripts/podcast/build-catalog.mjs \
   --limit 3 \                        # 這次最多處理 3 個新檔
   --model gemini-3.5-flash-lite \    # 章節與互動卡用的模型
   --transcribe-model gemini-3.8-flash \ # 逐字稿另外指定模型
+  --fallback-models gemini-3.7-flash,gemini-3.6-flash \ # 主模型滿載時的備援順序
   --max-rounds 8                     # 長節目逐字稿續寫上限
 ```
 
@@ -251,6 +253,21 @@ Google 的模型世代換得很快，**新申請的金鑰拿不到 `gemini-2.5-*
 | `gemini-3.1-pro-preview` | ⚠️ 需付費帳戶 | 價目表上**沒有公布價格**，帳單不可預測 |
 | `gemini-3.5-transcribe` | ⚠️ 不適用 | 轉錄品質好，但不支援 JSON mode、**不輸出時間戳**、預設簡體中文 |
 | `gemini-2.5-pro` / `gemini-2.5-flash` | ❌ 新金鑰不可用 | 只有既有帳號還能呼叫 |
+
+### 遇到 503「high demand」會怎麼處理
+
+尖峰時段 Gemini 會回 `503 UNAVAILABLE / This model is currently experiencing high demand`。
+這是 Google 那邊暫時滿載，不是音檔或設定的問題。腳本會自己吞掉它：
+
+1. **重試**：最多 8 次、退避從 2 秒拉到 45 秒，總預算 5 分鐘（舊版只撐 10 秒就放棄）。
+2. **換模型**：重試完還是不行，就依備援清單換一個模型接著跑，並把實際用到的模型記進
+   `stats.actualModels` 和 `stats.notes`。`404`（金鑰拿不到這個模型）和 `429`（配額用盡）同樣會觸發。
+3. **保住已完成的部分**：逐字稿某一輪掛掉時，前面轉好的段落會留著，該集標成 `partial`
+   而不是整集 `failed`；下次重跑從斷點接著補，補齊後互動卡也會自動重做一份。
+
+備援順序預設是 `gemini-3.8-flash → 3.7 → 3.6 → 3.5-flash-lite`，
+可用 `GEMINI_FALLBACK_MODELS` 或 `--fallback-models` 改。
+重試預算可用 `GEMINI_RETRY_BUDGET_MS` / `GEMINI_MAX_BACKOFF_MS` 調。
 
 ---
 
@@ -290,6 +307,7 @@ components/podcast/
 - 逐字稿偶爾會寫錯專有名詞（實測出現過把人名「劉傑中」寫成「劉捷中」）。章節地圖那一關通常是對的，可互相對照。
 - 互動卡的「節目沒提到」補充來自模型自身知識，**沒有經過查證**。介面上已標明出處是補充而非節目內容，但重要數據建議自行確認。
 - 逐字稿是一次性產生後快取，不是即時轉錄。
+- 備援模型頂上時，逐字稿快取仍以「你指定的模型」命名；之後重跑會沿用那份內容，不會因為主模型恢復就重轉。
 - 對話歷程存在瀏覽器記憶體裡，重新整理就消失。
 - `public/media` 是來源檔的 hardlink，不佔額外空間，但跨磁碟時會退回複製。
 
