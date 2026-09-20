@@ -105,10 +105,14 @@ cd podcast-learning
 npm install
 ```
 
+沒有裝 git 的話，直接下載 ZIP 也可以：
+<https://github.com/canlgz/podcast-learning/archive/refs/heads/main.zip>
+解壓縮後在資料夾裡開終端機，一樣執行 `npm install`。
+
 建立設定檔：
 
 ```bash
-cp .env.example .env.local
+cp .env.example .env.local     # Windows 用 copy .env.example .env.local
 ```
 
 用編輯器打開 `.env.local`，填入兩個東西：
@@ -131,6 +135,26 @@ npm run podcast:dry
 ```
 
 會列出資料夾裡找到哪些音檔、以及會不會進行分析，但不呼叫 API、不花錢。
+
+### 更新到新版
+
+用 git 裝的，一行就好：
+
+```bash
+git pull && npm install
+```
+
+**用 ZIP 裝的，最單純的做法是整個重裝**：
+
+1. 舊資料夾刪掉（或改名 `podcast-learning-old` 留著）
+2. 重新下載 <https://github.com/canlgz/podcast-learning/archive/refs/heads/main.zip> 並解壓縮
+3. 在新資料夾裡跑 `npm install`
+4. `copy .env.example .env.local`，把金鑰和音檔資料夾路徑再填一次
+5. `npm run podcast:dry` 確認讀得到音檔，然後 `npm run podcast:sync`
+
+重裝等於 `.cache/podcast/` 一併清掉，**每一集都會重新分析、重新計費**（一集約 US$0.15）。
+集數多又想省的話，就別整包重裝，只把 `scripts/` 資料夾換成新版的，
+`.env.local`、`.cache/`、`data/`、`public/media/` 原地不動即可。
 
 ---
 
